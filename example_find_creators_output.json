@@ -1,0 +1,69 @@
+[
+  {
+    "channel_id": "UCvze_ksdXZpXlNeYV-ZZQ",
+    "channel_name": "Yoga With Adriene",
+    "channel_url": "https://www.youtube.com/channel/UCvze_ksdXZpXlNeYV-ZZQ",
+    "channel_description": "Yoga With Adriene provides high quality practices on yoga and mindfulness at no cost...",
+    "subscriber_count": 12500000,
+    "channel_video_count": 850,
+    "channel_view_count": 1500000000,
+    "sample_video_id": "v7AYKMP6rOE",
+    "sample_video_title": "Yoga For Complete Beginners - 20 Minute Home Yoga Workout!",
+    "sample_video_url": "https://www.youtube.com/watch?v=v7AYKMP6rOE",
+    "detected_location": {
+      "country": "USA",
+      "city": "Austin",
+      "confidence": 20,
+      "sources": ["about_page", "domain"]
+    },
+    "location_sources": ["about_page", "domain"],
+    "about_text": "Yoga With Adriene is a YouTube channel dedicated to providing free yoga videos. Based in Austin, Texas...",
+    "social_links": [
+      "https://www.instagram.com/yogawithadriene",
+      "https://www.facebook.com/yogawithadriene",
+      "https://twitter.com/yogawithadriene"
+    ],
+    "websites": [
+      "https://yogawithadriene.com"
+    ],
+    "contact_email_public": "contact@yogawithadriene.com",
+    "all_emails": [
+      "contact@yogawithadriene.com"
+    ],
+    "confidence_score": 95.5,
+    "extraction_path": "api+playwright",
+    "scraped_at": "2025-11-11T22:30:45.123456"
+  },
+  {
+    "channel_id": "UCj0V0aG4LcdHmdPJ7aTtSCQ",
+    "channel_name": "Boho Beautiful Yoga",
+    "channel_url": "https://www.youtube.com/channel/UCj0V0aG4LcdHmdPJ7aTtSCQ",
+    "channel_description": "Yoga, Pilates, Meditation and Travel. Join us on our journey...",
+    "subscriber_count": 3200000,
+    "channel_video_count": 450,
+    "channel_view_count": 450000000,
+    "sample_video_id": "GLy2rYHwUqY",
+    "sample_video_title": "Full Body Yoga Workout | 30 Min Yoga For Strength",
+    "sample_video_url": "https://www.youtube.com/watch?v=GLy2rYHwUqY",
+    "detected_location": {
+      "country": "Canada",
+      "city": "Vancouver",
+      "confidence": 18,
+      "sources": ["about_page", "video_titles"]
+    },
+    "location_sources": ["about_page", "video_titles"],
+    "about_text": "Boho Beautiful is a yoga and lifestyle channel based in Vancouver, Canada...",
+    "social_links": [
+      "https://www.instagram.com/bohobeautiful",
+      "https://www.facebook.com/bohobeautifullife"
+    ],
+    "websites": [
+      "https://bohobeautiful.life"
+    ],
+    "contact_email_public": null,
+    "all_emails": [],
+    "confidence_score": 88.2,
+    "extraction_path": "api+playwright",
+    "scraped_at": "2025-11-11T22:31:12.654321"
+  }
+]
