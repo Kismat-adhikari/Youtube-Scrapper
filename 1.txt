@@ -1,0 +1,6 @@
+with link:
+python scraper.py
+
+
+with niche and sub neache
+python find_creators.py

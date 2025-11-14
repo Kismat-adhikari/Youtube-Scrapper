@@ -9,6 +9,7 @@ import re
 import json
 import argparse
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Set
@@ -30,12 +31,44 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class ProxyManager:
-    """Manages proxy rotation"""
+def validate_email(email: str) -> bool:
+    """Validate email format and domain"""
+    if not email:
+        return False
     
-    def __init__(self, proxy_file: str = 'proxies.txt'):
+    # Basic format check
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_pattern, email):
+        return False
+    
+    # Check for suspicious patterns
+    suspicious = ['noreply', 'no-reply', 'donotreply', 'example', 'test', 'fake']
+    email_lower = email.lower()
+    if any(pattern in email_lower for pattern in suspicious):
+        return False
+    
+    # Check domain
+    try:
+        domain = email.split('@')[1]
+        # Filter out common non-business domains
+        blocked_domains = ['youtube.com', 'google.com', 'gmail.com', 'yahoo.com', 'hotmail.com']
+        if domain.lower() in blocked_domains:
+            return False
+        return True
+    except:
+        return False
+
+
+class ProxyManager:
+    """Manages proxy rotation and blacklisting"""
+    
+    def __init__(self, proxy_file: str = 'proxies.txt', blacklist_threshold: int = 5):
         self.proxies = []
+        self.proxy_failures = {}
+        self.blacklist_threshold = blacklist_threshold
         self.current_index = 0
+        self.successful_uses = 0
+        self.rotation_interval = 4
         
         if os.path.exists(proxy_file):
             self._load_proxies(proxy_file)
@@ -49,14 +82,42 @@ class ProxyManager:
                     self.proxies.append(line)
         logger.info(f"Loaded {len(self.proxies)} proxies")
     
-    def get_next_proxy(self) -> Optional[str]:
-        """Get next proxy in rotation"""
+    def get_next_proxy(self, force_rotate: bool = False) -> Optional[str]:
+        """Get next available proxy"""
         if not self.proxies:
             return None
         
-        proxy = self.proxies[self.current_index]
-        self.current_index = (self.current_index + 1) % len(self.proxies)
-        return proxy
+        # Force rotation on failure or after 4 successful uses
+        if force_rotate or self.successful_uses >= self.rotation_interval:
+            self.current_index = (self.current_index + 1) % len(self.proxies)
+            self.successful_uses = 0
+            if not force_rotate:
+                logger.info(f"  🔄 Rotating proxy after {self.rotation_interval} successful channels")
+        
+        # Find next non-blacklisted proxy
+        attempts = 0
+        while attempts < len(self.proxies):
+            proxy = self.proxies[self.current_index]
+            
+            if self.proxy_failures.get(proxy, 0) < self.blacklist_threshold:
+                return proxy
+            
+            self.current_index = (self.current_index + 1) % len(self.proxies)
+            attempts += 1
+        
+        return None
+    
+    def report_success(self):
+        """Report successful proxy use"""
+        self.successful_uses += 1
+    
+    def report_failure(self, proxy: str):
+        """Report proxy failure"""
+        if proxy:
+            self.proxy_failures[proxy] = self.proxy_failures.get(proxy, 0) + 1
+            if self.proxy_failures[proxy] >= self.blacklist_threshold:
+                logger.warning(f"Proxy {proxy} blacklisted after {self.blacklist_threshold} failures")
+            self.successful_uses = 0
 
 
 class YouTubeAPI:
@@ -173,7 +234,7 @@ class ChannelScraper:
         proxy = self.proxy_manager.get_next_proxy()
         
         with sync_playwright() as p:
-            browser_args = {'headless': False}  # Headed mode for now
+            browser_args = {'headless': True}  # Always headless
             
             if proxy:
                 parts = proxy.split(':')
@@ -439,17 +500,14 @@ class ChannelScraper:
     
     @staticmethod
     def _extract_emails(text: str) -> List[str]:
-        """Extract email addresses from text"""
+        """Extract and validate email addresses from text"""
         email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
         emails = re.findall(email_pattern, text)
         
-        # Filter out common non-business emails
-        filtered = [
-            e for e in emails 
-            if not any(x in e.lower() for x in ['noreply', 'example', 'test', 'youtube', 'google'])
-        ]
+        # Validate each email
+        valid_emails = [e for e in emails if validate_email(e)]
         
-        return filtered
+        return valid_emails
     
     @staticmethod
     def _extract_location_from_text(text: str, target_location: Optional[str] = None) -> Dict:
@@ -574,6 +632,61 @@ class ChannelFinder:
         self.scraper = ChannelScraper(self.proxy_manager)
         self.results_dir = Path('results')
         self.results_dir.mkdir(exist_ok=True)
+        self.scraped_channel_ids: Set[str] = set()
+        self.start_time = None
+        
+        # Load previously scraped channel IDs for duplicate detection
+        self._load_scraped_history()
+    
+    def _load_scraped_history(self):
+        """Load previously scraped channel IDs from existing CSV files"""
+        try:
+            csv_files = list(self.results_dir.glob('*_channels.csv'))
+            for csv_file in csv_files:
+                try:
+                    df = pd.read_csv(csv_file)
+                    if 'channel_id' in df.columns:
+                        self.scraped_channel_ids.update(df['channel_id'].dropna().astype(str).tolist())
+                except Exception as e:
+                    logger.debug(f"Could not load history from {csv_file}: {e}")
+            
+            if self.scraped_channel_ids:
+                logger.info(f"Loaded {len(self.scraped_channel_ids)} previously scraped channel IDs")
+        except Exception as e:
+            logger.debug(f"Could not load scraping history: {e}")
+    
+    def _calculate_eta(self, current: int, total: int) -> str:
+        """Calculate estimated time remaining"""
+        if not self.start_time or current == 0:
+            return "calculating..."
+        
+        elapsed = time.time() - self.start_time
+        avg_time_per_channel = elapsed / current
+        remaining_channels = total - current
+        eta_seconds = avg_time_per_channel * remaining_channels
+        
+        # Format ETA
+        if eta_seconds < 60:
+            return f"{int(eta_seconds)}s"
+        elif eta_seconds < 3600:
+            return f"{int(eta_seconds / 60)}m {int(eta_seconds % 60)}s"
+        else:
+            hours = int(eta_seconds / 3600)
+            minutes = int((eta_seconds % 3600) / 60)
+            return f"{hours}h {minutes}m"
+    
+    def _print_progress(self, current: int, total: int, channel_name: str):
+        """Print progress bar with ETA"""
+        percentage = (current / total) * 100
+        eta = self._calculate_eta(current, total)
+        bar_length = 30
+        filled = int(bar_length * current / total)
+        bar = '█' * filled + '░' * (bar_length - filled)
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Progress: [{bar}] {percentage:.1f}% ({current}/{total})")
+        logger.info(f"ETA: {eta} | Current: {channel_name}")
+        logger.info(f"{'='*60}\n")
     
     def search_channels(self, niche: str, sub_niche: Optional[str] = None, 
                        location: Optional[str] = None, max_results: int = 50,
@@ -632,12 +745,36 @@ class ChannelFinder:
             channel_details = filtered
             logger.info(f"Filtered to {len(channel_details)} channels with {min_subscribers:,}+ subscribers")
         
-        # Step 3: Scrape each channel
+        # Remove already-scraped channels (duplicate detection)
+        original_count = len(channel_details)
+        channel_details = {cid: data for cid, data in channel_details.items() if cid not in self.scraped_channel_ids}
+        
+        if len(channel_details) < original_count:
+            skipped = original_count - len(channel_details)
+            logger.info(f"Skipped {skipped} already-scraped channel(s)")
+        
+        if not channel_details:
+            logger.info("All channels have already been scraped!")
+            return []
+        
+        # Step 3: Scrape each channel with progress tracking
         logger.info(f"\nStep 3: Scraping {len(channel_details)} channels...")
+        logger.info(f"Results will be saved in real-time after each channel")
         enriched_channels = []
         
+        # Initialize timestamp for consistent filenames
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
+        niche_slug = re.sub(r'[^\w\s-]', '', query).strip().replace(' ', '_')
+        self.start_time = time.time()
+        
         for i, (channel_id, api_data) in enumerate(channel_details.items(), 1):
-            logger.info(f"\n[{i}/{len(channel_details)}] Processing: {api_data['snippet']['title']}")
+            channel_name = api_data['snippet']['title']
+            
+            # Show progress every 5 channels or on first/last
+            if i == 1 or i == len(channel_details) or i % 5 == 0:
+                self._print_progress(i, len(channel_details), channel_name)
+            
+            logger.info(f"\n[{i}/{len(channel_details)}] Processing: {channel_name}")
             
             channel_url = f"https://www.youtube.com/channel/{channel_id}"
             
@@ -651,11 +788,75 @@ class ChannelFinder:
             merged['confidence_score'] = self._calculate_confidence(merged, query, location)
             
             enriched_channels.append(merged)
+            self.scraped_channel_ids.add(channel_id)
+            
+            # Save immediately after each channel (real-time updates)
+            self._save_incremental(enriched_channels, timestamp, niche_slug)
         
         # Step 4: Rank by confidence
         enriched_channels.sort(key=lambda x: x['confidence_score'], reverse=True)
         
+        # Final save with sorted results
+        self._save_final(enriched_channels[:max_results], timestamp, niche_slug)
+        
         return enriched_channels[:max_results]
+    
+    def _save_incremental(self, channels: List[Dict], timestamp: str, niche_slug: str):
+        """Save results incrementally after each channel"""
+        if not channels:
+            return
+        
+        csv_path = self.results_dir / f"{timestamp}_{niche_slug}_channels.csv"
+        json_path = self.results_dir / f"{timestamp}_{niche_slug}_channels.json"
+        
+        # Prepare data for CSV
+        csv_data = []
+        for ch in channels:
+            row = ch.copy()
+            # Convert lists to JSON strings for CSV
+            for key in ['social_links', 'websites', 'all_emails', 'location_sources', 'sample_videos']:
+                if key in row and isinstance(row[key], (list, dict)):
+                    row[key] = json.dumps(row[key])
+            csv_data.append(row)
+        
+        # Save CSV
+        df = pd.DataFrame(csv_data)
+        df.to_csv(csv_path, index=False, encoding='utf-8')
+        
+        # Save JSON
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(channels, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"  💾 Saved progress: {len(channels)} channel(s) → {csv_path.name}")
+    
+    def _save_final(self, channels: List[Dict], timestamp: str, niche_slug: str):
+        """Save final sorted results"""
+        if not channels:
+            return
+        
+        csv_path = self.results_dir / f"{timestamp}_{niche_slug}_channels.csv"
+        json_path = self.results_dir / f"{timestamp}_{niche_slug}_channels.json"
+        
+        # Prepare data for CSV
+        csv_data = []
+        for ch in channels:
+            row = ch.copy()
+            # Convert lists to JSON strings for CSV
+            for key in ['social_links', 'websites', 'all_emails', 'location_sources', 'sample_videos']:
+                if key in row and isinstance(row[key], (list, dict)):
+                    row[key] = json.dumps(row[key])
+            csv_data.append(row)
+        
+        # Save CSV
+        df = pd.DataFrame(csv_data)
+        df.to_csv(csv_path, index=False, encoding='utf-8')
+        
+        # Save JSON
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(channels, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"\n✅ CSV saved to: {csv_path}")
+        logger.info(f"✅ JSON saved to: {json_path}")
 
     
     def _merge_channel_data(self, api_data: Dict, scraped_data: Dict, sample_video_id: Optional[str]) -> Dict:
@@ -750,43 +951,21 @@ class ChannelFinder:
             score += 5
         
         return round(score, 2)
-    
-    def save_results(self, channels: List[Dict], niche: str):
-        """Save results to CSV and JSON"""
-        timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
-        niche_slug = re.sub(r'[^\w\s-]', '', niche).strip().replace(' ', '_')
-        
-        csv_path = self.results_dir / f"{timestamp}_{niche_slug}_channels.csv"
-        json_path = self.results_dir / f"{timestamp}_{niche_slug}_channels.json"
-        
-        if channels:
-            # Prepare data for CSV
-            csv_data = []
-            for ch in channels:
-                row = ch.copy()
-                # Convert lists to JSON strings for CSV
-                for key in ['social_links', 'websites', 'all_emails']:
-                    if key in row and isinstance(row[key], list):
-                        row[key] = json.dumps(row[key])
-                csv_data.append(row)
-            
-            # Save CSV
-            df = pd.DataFrame(csv_data)
-            df.to_csv(csv_path, index=False, encoding='utf-8')
-            logger.info(f"\n✅ CSV saved to: {csv_path}")
-            
-            # Save JSON
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(channels, f, indent=2, ensure_ascii=False)
-            logger.info(f"✅ JSON saved to: {json_path}")
-        
-        return csv_path, json_path
+
 
 
 def main():
     """Main entry point"""
     print("\n" + "="*60)
     print("YouTube Channel Finder by Niche & Country")
+    print("="*60)
+    print("\nFeatures:")
+    print("  ✓ Real-time saving after each channel")
+    print("  ✓ Duplicate detection (skips already-scraped channels)")
+    print("  ✓ Email validation")
+    print("  ✓ Progress bar with ETA")
+    print("  ✓ Proxy rotation (every 4 successful channels)")
+    print("  ✓ Headless mode (runs in background)")
     print("="*60 + "\n")
     
     # Get user input
@@ -853,18 +1032,14 @@ def main():
                 print(f"   Social: {len(ch['social_links'])} links")
             print()
         
-        # Save results
-        csv_path, json_path = finder.save_results(channels, niche)
-        
         # Summary
+        elapsed = time.time() - finder.start_time if finder.start_time else 0
         print("\n" + "="*60)
         print("Summary")
         print("="*60)
+        print(f"Completed in {int(elapsed/60)}m {int(elapsed%60)}s")
         print(f"Total channels found: {len(channels)}")
         print(f"Total API calls: {finder.api.api_calls}")
-        print(f"Results saved to:")
-        print(f"  - {csv_path}")
-        print(f"  - {json_path}")
         print("="*60 + "\n")
         
     except KeyboardInterrupt:

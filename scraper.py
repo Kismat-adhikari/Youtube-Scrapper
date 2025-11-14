@@ -9,9 +9,10 @@ import re
 import json
 import argparse
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
@@ -56,6 +57,34 @@ def decode_youtube_redirect(url: str) -> Optional[str]:
     return url
 
 
+def validate_email(email: str) -> bool:
+    """Validate email format and domain"""
+    if not email:
+        return False
+    
+    # Basic format check
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_pattern, email):
+        return False
+    
+    # Check for suspicious patterns
+    suspicious = ['noreply', 'no-reply', 'donotreply', 'example', 'test', 'fake']
+    email_lower = email.lower()
+    if any(pattern in email_lower for pattern in suspicious):
+        return False
+    
+    # Check domain
+    try:
+        domain = email.split('@')[1]
+        # Filter out common non-business domains
+        blocked_domains = ['youtube.com', 'google.com', 'gmail.com', 'yahoo.com', 'hotmail.com']
+        if domain.lower() in blocked_domains:
+            return False
+        return True
+    except:
+        return False
+
+
 def extract_emails_from_text(text: str) -> List[str]:
     """Extract valid email addresses from text"""
     if not text:
@@ -64,13 +93,10 @@ def extract_emails_from_text(text: str) -> List[str]:
     email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
     emails = re.findall(email_pattern, text)
     
-    # Filter out common non-business emails
-    filtered = [
-        e for e in emails 
-        if not any(x in e.lower() for x in ['noreply', 'example', 'test', '@youtube.com', '@google.com'])
-    ]
+    # Validate each email
+    valid_emails = [e for e in emails if validate_email(e)]
     
-    return list(set(filtered))  # Remove duplicates
+    return list(set(valid_emails))  # Remove duplicates
 
 
 def extract_urls_from_text(text: str) -> List[str]:
@@ -109,6 +135,8 @@ class ProxyManager:
         self.proxy_failures = {}
         self.blacklist_threshold = blacklist_threshold
         self.current_index = 0
+        self.successful_uses = 0  # Track successful uses of current proxy
+        self.rotation_interval = 4  # Change proxy every 4 successful videos
         
         if proxy_file and os.path.exists(proxy_file):
             self._load_proxies(proxy_file)
@@ -122,21 +150,39 @@ class ProxyManager:
                     self.proxies.append(line)
         logger.info(f"Loaded {len(self.proxies)} proxies")
     
-    def get_next_proxy(self) -> Optional[str]:
-        """Get next available proxy"""
+    def get_next_proxy(self, force_rotate: bool = False) -> Optional[str]:
+        """Get next available proxy
+        
+        Args:
+            force_rotate: If True, forces rotation to next proxy (used on failure)
+        """
         if not self.proxies:
             return None
         
+        # Force rotation on failure or after 4 successful uses
+        if force_rotate or self.successful_uses >= self.rotation_interval:
+            self.current_index = (self.current_index + 1) % len(self.proxies)
+            self.successful_uses = 0
+            if not force_rotate:
+                logger.info(f"  🔄 Rotating proxy after {self.rotation_interval} successful videos")
+        
+        # Find next non-blacklisted proxy
         attempts = 0
         while attempts < len(self.proxies):
             proxy = self.proxies[self.current_index]
-            self.current_index = (self.current_index + 1) % len(self.proxies)
             
             if self.proxy_failures.get(proxy, 0) < self.blacklist_threshold:
                 return proxy
+            
+            # This proxy is blacklisted, try next one
+            self.current_index = (self.current_index + 1) % len(self.proxies)
             attempts += 1
         
         return None
+    
+    def report_success(self):
+        """Report successful proxy use"""
+        self.successful_uses += 1
     
     def report_failure(self, proxy: str):
         """Report proxy failure"""
@@ -144,6 +190,8 @@ class ProxyManager:
             self.proxy_failures[proxy] = self.proxy_failures.get(proxy, 0) + 1
             if self.proxy_failures[proxy] >= self.blacklist_threshold:
                 logger.warning(f"Proxy {proxy} blacklisted after {self.blacklist_threshold} failures")
+            # Reset success counter on failure
+            self.successful_uses = 0
 
 
 class YouTubeAPI:
@@ -232,6 +280,61 @@ class YouTubeScraper:
         
         self.scraped_videos = []
         self.failed_videos = []
+        self.scraped_video_ids: Set[str] = set()  # Track scraped video IDs
+        self.start_time = None
+        
+        # Load previously scraped video IDs for duplicate detection
+        self._load_scraped_history()
+    
+    def _load_scraped_history(self):
+        """Load previously scraped video IDs from existing CSV files"""
+        try:
+            csv_files = list(self.results_dir.glob('*_videos.csv'))
+            for csv_file in csv_files:
+                try:
+                    df = pd.read_csv(csv_file)
+                    if 'video_id' in df.columns:
+                        self.scraped_video_ids.update(df['video_id'].dropna().astype(str).tolist())
+                except Exception as e:
+                    logger.debug(f"Could not load history from {csv_file}: {e}")
+            
+            if self.scraped_video_ids:
+                logger.info(f"Loaded {len(self.scraped_video_ids)} previously scraped video IDs")
+        except Exception as e:
+            logger.debug(f"Could not load scraping history: {e}")
+    
+    def _calculate_eta(self, current: int, total: int) -> str:
+        """Calculate estimated time remaining"""
+        if not self.start_time or current == 0:
+            return "calculating..."
+        
+        elapsed = time.time() - self.start_time
+        avg_time_per_video = elapsed / current
+        remaining_videos = total - current
+        eta_seconds = avg_time_per_video * remaining_videos
+        
+        # Format ETA
+        if eta_seconds < 60:
+            return f"{int(eta_seconds)}s"
+        elif eta_seconds < 3600:
+            return f"{int(eta_seconds / 60)}m {int(eta_seconds % 60)}s"
+        else:
+            hours = int(eta_seconds / 3600)
+            minutes = int((eta_seconds % 3600) / 60)
+            return f"{hours}h {minutes}m"
+    
+    def _print_progress(self, current: int, total: int, video_id: str):
+        """Print progress bar with ETA"""
+        percentage = (current / total) * 100
+        eta = self._calculate_eta(current, total)
+        bar_length = 30
+        filled = int(bar_length * current / total)
+        bar = '█' * filled + '░' * (bar_length - filled)
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Progress: [{bar}] {percentage:.1f}% ({current}/{total})")
+        logger.info(f"ETA: {eta} | Current: {video_id}")
+        logger.info(f"{'='*60}\n")
     
     @staticmethod
     def extract_video_id(url: str) -> Optional[str]:
@@ -261,7 +364,7 @@ class YouTubeScraper:
         video_ids = []
         
         with sync_playwright() as p:
-            browser_args = {'headless': False}
+            browser_args = {'headless': True}  # Always headless
             
             # Use proxy if available
             proxy = self.proxy_manager.get_next_proxy()
@@ -409,7 +512,7 @@ class YouTubeScraper:
         url = f"https://www.youtube.com/watch?v={video_id}"
         
         with sync_playwright() as p:
-            browser_args = {'headless': False}
+            browser_args = {'headless': True}  # Always headless
             
             if proxy:
                 # Parse proxy format: ip:port:username:password
@@ -875,8 +978,9 @@ class YouTubeScraper:
         logger.info(f"[{video_num}/{total}] Processing {video_id}")
         
         for attempt in range(self.args.proxy_retries):
-            # Always get next proxy (rotates through list)
-            proxy = self.proxy_manager.get_next_proxy()
+            # Get proxy (force rotate on retry attempts after first failure)
+            force_rotate = attempt > 0  # Force new proxy on retries
+            proxy = self.proxy_manager.get_next_proxy(force_rotate=force_rotate)
             
             if proxy:
                 proxy_display = proxy.split(':')[0]
@@ -888,6 +992,9 @@ class YouTubeScraper:
             
             if result:
                 logger.info(f"  ✓ Scraped successfully — channel: {result.get('channel_name', 'Unknown')}")
+                # Report success to proxy manager
+                if proxy:
+                    self.proxy_manager.report_success()
                 return result
             else:
                 logger.warning(f"  ✗ Failed (CAPTCHA or error)")
@@ -968,10 +1075,25 @@ class YouTubeScraper:
             for video in videos:
                 cid = video.get('channel_id')
                 if cid and cid in api_channels:
-                    channel_stats = api_channels[cid].get('statistics', {})
+                    channel_data = api_channels[cid]
+                    channel_stats = channel_data.get('statistics', {})
+                    channel_snippet = channel_data.get('snippet', {})
+                    
                     video['channel_subscriber_count'] = int(channel_stats.get('subscriberCount', 0))
                     video['channel_video_count'] = int(channel_stats.get('videoCount', 0))
                     video['channel_view_count'] = int(channel_stats.get('viewCount', 0))
+                    
+                    # Add channel creation date
+                    published_at = channel_snippet.get('publishedAt')
+                    if published_at:
+                        try:
+                            # Convert from ISO format to readable date
+                            dt = datetime.fromisoformat(published_at.replace('Z', '+00:00'))
+                            video['channel_created_date'] = dt.strftime('%Y-%m-%d')
+                            video['channel_created_year'] = dt.year
+                        except:
+                            video['channel_created_date'] = published_at
+                    
                     video['field_source_channel_stats'] = 'api'
         
         if self.api.api_calls > 0:
@@ -1022,55 +1144,91 @@ class YouTubeScraper:
             if not incremental:
                 logger.info(f"Failed videos saved to {failed_path}")
     
-    def run(self, video_urls: List[str]):
+    def run(self, video_urls: List[str], retry_failed: bool = False):
         """Main scraping workflow"""
         # Extract and validate video IDs
         video_ids = []
         
-        for url in video_urls:
-            url = url.strip()
-            if not url:
-                continue
-            
-            # Check if it's a search results URL
-            if self.is_search_url(url):
-                logger.info(f"\n{'='*60}")
-                logger.info("Detected YouTube search results URL")
-                logger.info(f"{'='*60}\n")
-                
-                # Extract videos from search results (up to 30 videos)
-                search_video_ids = self.extract_videos_from_search(url, max_videos=30)
-                
-                if search_video_ids:
-                    logger.info(f"Will scrape {len(search_video_ids)} videos from search results\n")
-                    video_ids.extend(search_video_ids)
-                else:
-                    logger.error("Failed to extract videos from search results")
+        if retry_failed:
+            # Load failed videos from previous run
+            failed_path = self.results_dir / 'failed.csv'
+            if failed_path.exists():
+                try:
+                    df_failed = pd.read_csv(failed_path)
+                    if 'video_id' in df_failed.columns:
+                        video_ids = df_failed['video_id'].tolist()
+                        logger.info(f"Retrying {len(video_ids)} failed videos from previous run")
+                except Exception as e:
+                    logger.error(f"Could not load failed videos: {e}")
+                    return
             else:
-                # Regular video URL
-                video_id = self.extract_video_id(url)
-                if video_id:
-                    video_ids.append(video_id)
+                logger.error("No failed.csv found to retry")
+                return
+        else:
+            for url in video_urls:
+                url = url.strip()
+                if not url:
+                    continue
+                
+                # Check if it's a search results URL
+                if self.is_search_url(url):
+                    logger.info(f"\n{'='*60}")
+                    logger.info("Detected YouTube search results URL")
+                    logger.info(f"{'='*60}\n")
+                    
+                    # Extract videos from search results (up to 30 videos)
+                    search_video_ids = self.extract_videos_from_search(url, max_videos=30)
+                    
+                    if search_video_ids:
+                        logger.info(f"Will scrape {len(search_video_ids)} videos from search results\n")
+                        video_ids.extend(search_video_ids)
+                    else:
+                        logger.error("Failed to extract videos from search results")
                 else:
-                    logger.warning(f"Invalid URL, skipping: {url}")
+                    # Regular video URL
+                    video_id = self.extract_video_id(url)
+                    if video_id:
+                        video_ids.append(video_id)
+                    else:
+                        logger.warning(f"Invalid URL, skipping: {url}")
         
         if not video_ids:
             logger.error("No valid video URLs provided")
             return
         
+        # Remove duplicates and already-scraped videos
+        original_count = len(video_ids)
+        video_ids = [vid for vid in video_ids if vid not in self.scraped_video_ids]
+        video_ids = list(dict.fromkeys(video_ids))  # Remove duplicates while preserving order
+        
+        if len(video_ids) < original_count:
+            skipped = original_count - len(video_ids)
+            logger.info(f"Skipped {skipped} already-scraped video(s)")
+        
+        if not video_ids:
+            logger.info("All videos have already been scraped!")
+            return
+        
         logger.info(f"\n{'='*60}")
         logger.info(f"Starting scrape for {len(video_ids)} videos")
         logger.info(f"Results will be saved in real-time after each video")
+        logger.info(f"Mode: Headless (background)")
         logger.info(f"{'='*60}\n")
         
         # Initialize output timestamp for consistent filenames
         self.output_timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
+        self.start_time = time.time()
         
         # Scrape each video
         for i, video_id in enumerate(video_ids, 1):
+            # Show progress every 5 videos or on first/last
+            if i == 1 or i == len(video_ids) or i % 5 == 0:
+                self._print_progress(i, len(video_ids), video_id)
+            
             result = self.scrape_video(video_id, i, len(video_ids))
             if result:
                 self.scraped_videos.append(result)
+                self.scraped_video_ids.add(video_id)
                 
                 # Save immediately after each successful scrape (real-time updates)
                 self.save_results(incremental=True)
@@ -1086,8 +1244,12 @@ class YouTubeScraper:
             self.save_results(incremental=False)
         
         # Summary
+        elapsed = time.time() - self.start_time
         logger.info(f"\n{'='*60}")
+        logger.info(f"Completed in {int(elapsed/60)}m {int(elapsed%60)}s")
         logger.info(f"Processed {len(video_ids)} videos — {len(self.scraped_videos)} scraped, {len(self.failed_videos)} skipped")
+        if self.failed_videos:
+            logger.info(f"Failed videos saved to results/failed.csv - use --retry-failed to retry")
         logger.info(f"{'='*60}")
 
 
@@ -1096,8 +1258,17 @@ def main():
     parser = argparse.ArgumentParser(description='YouTube Video Scraper')
     parser.add_argument('--proxy_retries', type=int, default=3, help='Number of proxy retries per video')
     parser.add_argument('--blacklist_threshold', type=int, default=5, help='Failures before blacklisting proxy')
+    parser.add_argument('--retry-failed', action='store_true', help='Retry failed videos from previous run')
     
     args = parser.parse_args()
+    
+    # Initialize scraper
+    scraper = YouTubeScraper(args)
+    
+    # Check if retrying failed videos
+    if args.retry_failed:
+        scraper.run([], retry_failed=True)
+        return
     
     # Get user input
     print("\n" + "="*60)
@@ -1108,6 +1279,13 @@ def main():
     print("  2. Search results: https://www.youtube.com/results?search_query=YOUR_QUERY")
     print("     (Will scrape up to 30 videos from search)")
     print("\nYou can mix both types, separated by commas")
+    print("\nFeatures:")
+    print("  ✓ Real-time saving after each video")
+    print("  ✓ Duplicate detection (skips already-scraped videos)")
+    print("  ✓ Email validation")
+    print("  ✓ Progress bar with ETA")
+    print("  ✓ Channel creation date extraction")
+    print("  ✓ Headless mode (runs in background)")
     print("="*60)
     
     urls_input = input("\nEnter YouTube URLs (comma separated): ")
@@ -1118,8 +1296,7 @@ def main():
     
     video_urls = [url.strip() for url in urls_input.split(',')]
     
-    # Initialize and run scraper
-    scraper = YouTubeScraper(args)
+    # Run scraper
     scraper.run(video_urls)
 
 
