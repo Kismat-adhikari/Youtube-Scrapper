@@ -272,6 +272,11 @@ class ChannelScraper:
                 sample_videos = self._extract_sample_videos(page, target_location)
                 data['sample_videos'] = sample_videos
                 
+                if sample_videos:
+                    logger.info(f"  Found {len(sample_videos)} sample video(s)")
+                else:
+                    logger.info(f"  No sample videos found")
+                
                 # Aggregate location data from all sources
                 location_result = self._aggregate_location_data(data, target_location)
                 data['detected_location'] = location_result
@@ -318,6 +323,51 @@ class ChannelScraper:
         except Exception as e:
             logger.debug(f"  Could not extract About text: {e}")
         
+        # Look for "View email address" button and click it
+        email_found = False
+        try:
+            page.wait_for_timeout(1000)
+            
+            email_button_selectors = [
+                'button:has-text("View email address")',
+                'button:has-text("View email")',
+                'yt-button-renderer:has-text("View email")',
+                '#link-list-container button:has-text("email")',
+                'ytd-button-renderer:has-text("email")',
+                'a:has-text("View email address")',
+                '[aria-label*="email"]'
+            ]
+            
+            for selector in email_button_selectors:
+                try:
+                    button = page.locator(selector).first
+                    if button.count() > 0 and button.is_visible():
+                        logger.info(f"  Found 'View email address' button, clicking...")
+                        button.click()
+                        page.wait_for_timeout(3000)
+                        
+                        page_content = page.content()
+                        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+                        emails = re.findall(email_pattern, page_content)
+                        
+                        valid_emails = [e for e in emails if validate_email(e)]
+                        
+                        if valid_emails:
+                            for email in valid_emails:
+                                if email not in data['emails']:
+                                    data['emails'].append(email)
+                            email_found = True
+                            logger.info(f"  Found email: {valid_emails[0]}")
+                            break
+                except Exception as e:
+                    logger.debug(f"  Email button selector '{selector}' failed: {e}")
+                    continue
+            
+            if not email_found:
+                logger.info(f"  No email button found on About page")
+        except Exception as e:
+            logger.debug(f"  Could not click email button: {e}")
+        
         # Extract social links and websites
         try:
             all_links = page.locator('a[href]').all()
@@ -353,30 +403,47 @@ class ChannelScraper:
         
         try:
             # Wait for video grid
-            page.wait_for_selector('ytd-grid-video-renderer', timeout=5000)
+            page.wait_for_selector('ytd-grid-video-renderer, ytd-rich-item-renderer', timeout=5000)
             
+            # Try multiple selectors for video elements
             video_elements = page.locator('ytd-grid-video-renderer').all()
+            if not video_elements:
+                video_elements = page.locator('ytd-rich-item-renderer').all()
+            
+            logger.debug(f"  Found {len(video_elements)} video elements")
             
             for i, elem in enumerate(video_elements[:max_videos]):
                 try:
-                    # Get video link
-                    link_elem = elem.locator('#video-title').first
+                    # Try multiple selectors for video link
+                    link_elem = elem.locator('#video-title, #video-title-link').first
                     if link_elem.count() == 0:
+                        logger.debug(f"  Video {i}: No link element found")
                         continue
                     
                     video_url = link_elem.get_attribute('href')
-                    video_title = link_elem.get_attribute('title') or link_elem.inner_text()
+                    video_title = link_elem.get_attribute('title')
                     
-                    if video_url:
+                    if not video_title:
+                        video_title = link_elem.inner_text().strip()
+                    
+                    if video_url and video_title:
                         # Extract video ID
                         video_id = None
                         if '/watch?v=' in video_url:
                             video_id = video_url.split('/watch?v=')[-1].split('&')[0]
+                        elif '/shorts/' in video_url:
+                            video_id = video_url.split('/shorts/')[-1].split('?')[0]
+                        
+                        # Build full URL
+                        if video_url.startswith('/'):
+                            full_url = f"https://www.youtube.com{video_url}"
+                        else:
+                            full_url = video_url
                         
                         video_data = {
                             'video_id': video_id,
                             'video_title': video_title,
-                            'video_url': f"https://www.youtube.com{video_url}" if video_url.startswith('/') else video_url
+                            'video_url': full_url
                         }
                         
                         # Check video title for location mentions
@@ -386,11 +453,14 @@ class ChannelScraper:
                                 video_data['location_mention'] = location_info
                         
                         videos.append(video_data)
+                        logger.debug(f"  Extracted video: {video_title[:50]}")
+                    else:
+                        logger.debug(f"  Video {i}: Missing URL or title")
                 except Exception as e:
                     logger.debug(f"  Could not extract video {i}: {e}")
                     continue
         except Exception as e:
-            logger.debug(f"  Could not extract sample videos: {e}")
+            logger.warning(f"  Could not extract sample videos: {e}")
         
         return videos
     
